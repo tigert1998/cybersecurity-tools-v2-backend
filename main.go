@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -31,8 +32,13 @@ type Config struct {
 	Versions []VersionInfo `json:"versions"`
 }
 
+type LatestPackage struct {
+	version  string
+	filepath string
+}
+
 var logger *slog.Logger
-var configCache atomic.Value
+var latestPackageCache atomic.Value
 
 func init() {
 	file, err := os.OpenFile(LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -43,56 +49,60 @@ func init() {
 	logger = slog.New(slog.NewJSONHandler(file, nil))
 }
 
-func loadConfig() (Config, error) {
+func loadLatestPackage() (LatestPackage, error) {
 	data, err := os.ReadFile(VersionConfigPath)
 	if err != nil {
-		return Config{}, err
+		return LatestPackage{}, err
 	}
 
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
-		return Config{}, err
+		return LatestPackage{}, err
+	}
+
+	if len(config.Versions) == 0 {
+		return LatestPackage{}, errors.New("No versions found")
 	}
 
 	sort.Slice(config.Versions, func(i, j int) bool {
 		return semver.Compare("v"+config.Versions[i].Version, "v"+config.Versions[j].Version) > 0
 	})
-	return config, nil
+
+	path := filepath.Join(PackageStoreDir, config.Versions[0].Path)
+	return LatestPackage{version: config.Versions[0].Version, filepath: path}, nil
 }
 
-func startConfigReloader() {
-	config, err := loadConfig()
+func startReloadLatestPackage() {
+	latestPackage, err := loadLatestPackage()
 	if err != nil {
 		logger.Error("首次加载配置失败", "error", err)
 	} else {
-		configCache.Store(config)
+		latestPackageCache.Store(latestPackage)
 	}
 
 	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			config, err := loadConfig()
+		for true {
+			time.Sleep(time.Second)
+			latestPackage, err := loadLatestPackage()
 			if err != nil {
 				logger.Error("刷新配置失败", "error", err)
 				continue
 			}
-			configCache.Store(config)
+			latestPackageCache.Store(latestPackage)
 		}
 	}()
 }
 
 func LimitMiddleware(limit int) gin.HandlerFunc {
-	semaphore := make(chan struct{}, limit) // 使用 struct{} 节省内存
+	semaphore := make(chan struct{}, limit)
 
 	return func(c *gin.Context) {
 		select {
 		case semaphore <- struct{}{}:
-			defer func() { <-semaphore }() // 确保即使 panic 也能释放
+			defer func() { <-semaphore }()
 			c.Next()
 		default:
-			c.AbortWithStatus(http.StatusTooManyRequests) // 明确返回 429
+			c.AbortWithStatus(http.StatusTooManyRequests)
 			return
 		}
 	}
@@ -100,47 +110,37 @@ func LimitMiddleware(limit int) gin.HandlerFunc {
 
 func main() {
 	gin.SetMode(gin.ReleaseMode)
-	startConfigReloader()
+	startReloadLatestPackage()
 
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(LimitMiddleware(2000))
 
 	r.GET("/latest_version", func(c *gin.Context) {
-		value := configCache.Load()
+		value := latestPackageCache.Load()
 		if value == nil {
-			c.String(http.StatusServiceUnavailable, "Config not loaded")
+			c.String(http.StatusServiceUnavailable, "Package not loaded")
 			return
 		}
 
-		config := value.(Config)
-		if len(config.Versions) == 0 {
-			c.String(http.StatusNotFound, "No versions found")
-			return
-		}
-
-		c.String(http.StatusOK, config.Versions[0].Version)
+		latestPackage := value.(LatestPackage)
+		c.String(http.StatusOK, latestPackage.version)
 	})
 
 	r.GET("/download/:version", func(c *gin.Context) {
 		version := c.Param("version")
 
-		value := configCache.Load()
+		value := latestPackageCache.Load()
 		if value == nil {
-			c.String(http.StatusServiceUnavailable, "Config not loaded")
+			c.String(http.StatusServiceUnavailable, "Package not loaded")
 			return
 		}
-		config := value.(Config)
-
-		for _, obj := range config.Versions {
-			if obj.Version == version {
-				filePath := filepath.Join(PackageStoreDir, obj.Path)
-				c.FileAttachment(filePath, obj.Path)
-				return
-			}
+		latestPackage := value.(LatestPackage)
+		if latestPackage.version == version {
+			c.FileAttachment(latestPackage.filepath, filepath.Base(latestPackage.filepath))
+		} else {
+			c.String(http.StatusNotFound, "Version not found")
 		}
-
-		c.String(http.StatusNotFound, "Version not found")
 	})
 
 	fmt.Printf("服务器运行于：0.0.0.0:%v\n", Port)
