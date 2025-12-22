@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/mod/semver"
@@ -30,6 +32,7 @@ type Config struct {
 }
 
 var logger *slog.Logger
+var configCache atomic.Value
 
 func init() {
 	file, err := os.OpenFile(LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -40,35 +43,81 @@ func init() {
 	logger = slog.New(slog.NewJSONHandler(file, nil))
 }
 
+func loadConfig() (Config, error) {
+	data, err := os.ReadFile(VersionConfigPath)
+	if err != nil {
+		return Config{}, err
+	}
+
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return Config{}, err
+	}
+
+	sort.Slice(config.Versions, func(i, j int) bool {
+		return semver.Compare("v"+config.Versions[i].Version, "v"+config.Versions[j].Version) > 0
+	})
+	return config, nil
+}
+
+func startConfigReloader() {
+	config, err := loadConfig()
+	if err != nil {
+		logger.Error("首次加载配置失败", "error", err)
+	} else {
+		configCache.Store(config)
+	}
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			config, err := loadConfig()
+			if err != nil {
+				logger.Error("刷新配置失败", "error", err)
+				continue
+			}
+			configCache.Store(config)
+		}
+	}()
+}
+
+func LimitMiddleware(limit int) gin.HandlerFunc {
+	semaphore := make(chan struct{}, limit) // 使用 struct{} 节省内存
+
+	return func(c *gin.Context) {
+		select {
+		case semaphore <- struct{}{}:
+			defer func() { <-semaphore }() // 确保即使 panic 也能释放
+			c.Next()
+		default:
+			c.AbortWithStatus(http.StatusTooManyRequests) // 明确返回 429
+			return
+		}
+	}
+}
+
 func main() {
 	gin.SetMode(gin.ReleaseMode)
+	startConfigReloader()
 
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(LimitMiddleware(2000))
 
 	r.GET("/latest_version", func(c *gin.Context) {
-		data, err := os.ReadFile(VersionConfigPath)
-		if err != nil {
-			logger.Error("读取配置文件失败", "error", err)
-			c.String(http.StatusInternalServerError, "Internal server error")
+		value := configCache.Load()
+		if value == nil {
+			c.String(http.StatusServiceUnavailable, "Config not loaded")
 			return
 		}
 
-		var config Config
-		if err := json.Unmarshal(data, &config); err != nil {
-			logger.Error("解析JSON失败", "error", err)
-			c.String(http.StatusInternalServerError, "Internal server error")
-			return
-		}
-
+		config := value.(Config)
 		if len(config.Versions) == 0 {
 			c.String(http.StatusNotFound, "No versions found")
 			return
 		}
-
-		sort.Slice(config.Versions, func(i, j int) bool {
-			return semver.Compare("v"+config.Versions[i].Version, "v"+config.Versions[j].Version) > 0
-		})
 
 		c.String(http.StatusOK, config.Versions[0].Version)
 	})
@@ -76,15 +125,12 @@ func main() {
 	r.GET("/download/:version", func(c *gin.Context) {
 		version := c.Param("version")
 
-		data, err := os.ReadFile(VersionConfigPath)
-		if err != nil {
-			logger.Error("读取配置文件失败", "error", err)
-			c.String(http.StatusInternalServerError, "Internal server error")
+		value := configCache.Load()
+		if value == nil {
+			c.String(http.StatusServiceUnavailable, "Config not loaded")
 			return
 		}
-
-		var config Config
-		json.Unmarshal(data, &config)
+		config := value.(Config)
 
 		for _, obj := range config.Versions {
 			if obj.Version == version {
