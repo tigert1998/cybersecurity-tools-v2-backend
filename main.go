@@ -19,7 +19,7 @@ const (
 	PackageStoreDir   = "./packages"
 	VersionConfigPath = "./packages/version.json"
 	LogFilePath       = "./log.txt"
-	Port              = 5000
+	Port              = 38686
 )
 
 type VersionInfo struct {
