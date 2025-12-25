@@ -1,25 +1,26 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"golang.org/x/mod/semver"
+	_ "modernc.org/sqlite"
 )
 
 const (
 	PackageStoreDir   = "./packages"
 	VersionConfigPath = "./packages/version.json"
 	LogFilePath       = "./log.txt"
+	DBPath            = "./main.db"
 	Port              = 38686
 )
 
@@ -28,48 +29,48 @@ type VersionInfo struct {
 	Path    string `json:"path"`
 }
 
-type Config struct {
-	Versions []VersionInfo `json:"versions"`
-}
-
-type LatestPackage struct {
-	version  string
-	filepath string
-}
-
 var logger *slog.Logger
+var db *sql.DB
 var latestPackageCache atomic.Value
 
 func init() {
+	var err error
+	db, err = sql.Open("sqlite", DBPath)
+	if err != nil {
+		panic("无法打开数据库：" + err.Error())
+	}
+	createTableSQL := `
+CREATE TABLE IF NOT EXISTS users (
+	ip TEXT NOT NULL PRIMARY KEY,
+	version TEXT NOT NULL,
+	timestamp INTEGER NOT NULL
+);`
+	_, err = db.Exec(createTableSQL)
+	if err != nil {
+		panic("创建数据表失败：" + err.Error())
+	}
+
 	file, err := os.OpenFile(LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		panic("无法创建日志文件：" + err.Error())
 	}
 
 	logger = slog.New(slog.NewJSONHandler(file, nil))
+
 }
 
-func loadLatestPackage() (LatestPackage, error) {
+func loadLatestPackage() (VersionInfo, error) {
 	data, err := os.ReadFile(VersionConfigPath)
 	if err != nil {
-		return LatestPackage{}, err
+		return VersionInfo{}, err
 	}
 
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return LatestPackage{}, err
+	var versionInfo VersionInfo
+	if err := json.Unmarshal(data, &versionInfo); err != nil {
+		return VersionInfo{}, err
 	}
 
-	if len(config.Versions) == 0 {
-		return LatestPackage{}, errors.New("No versions found")
-	}
-
-	sort.Slice(config.Versions, func(i, j int) bool {
-		return semver.Compare("v"+config.Versions[i].Version, "v"+config.Versions[j].Version) > 0
-	})
-
-	path := filepath.Join(PackageStoreDir, config.Versions[0].Path)
-	return LatestPackage{version: config.Versions[0].Version, filepath: path}, nil
+	return versionInfo, nil
 }
 
 func startReloadLatestPackage() {
@@ -116,34 +117,37 @@ func main() {
 	r.Use(gin.Recovery())
 	r.Use(LimitMiddleware(2000))
 
-	r.GET("/latest_version", func(c *gin.Context) {
+	r.GET("/version", func(c *gin.Context) {
 		value := latestPackageCache.Load()
 		if value == nil {
 			c.String(http.StatusServiceUnavailable, "Package not loaded")
 			return
 		}
 
-		latestPackage := value.(LatestPackage)
-		c.String(http.StatusOK, latestPackage.version)
+		latestPackage := value.(VersionInfo)
+		c.String(http.StatusOK, latestPackage.Version)
+
+		clientVersion := strings.TrimSpace(c.Query("q"))
+		if clientVersion != "" {
+			insertSQL := "INSERT OR REPLACE INTO users (ip, version, timestamp) VALUES (?, ?, ?);"
+			_, err := db.Exec(insertSQL, c.ClientIP(), clientVersion, time.Now().Unix())
+			if err != nil {
+				logger.Error("插入数据失败", "error", err)
+			}
+		}
 	})
 
-	r.GET("/download/:version", func(c *gin.Context) {
-		version := c.Param("version")
-
+	r.GET("/download", func(c *gin.Context) {
 		value := latestPackageCache.Load()
 		if value == nil {
 			c.String(http.StatusServiceUnavailable, "Package not loaded")
 			return
 		}
-		latestPackage := value.(LatestPackage)
-		if latestPackage.version == version {
-			c.FileAttachment(latestPackage.filepath, filepath.Base(latestPackage.filepath))
-		} else {
-			c.String(http.StatusNotFound, "Version not found")
-		}
+		latestPackage := value.(VersionInfo)
+		c.FileAttachment(filepath.Join(PackageStoreDir, latestPackage.Path), filepath.Base(latestPackage.Path))
 	})
 
-	fmt.Printf("服务器运行于：0.0.0.0:%v\n", Port)
+	logger.Info(fmt.Sprintf("服务器运行于：0.0.0.0:%v", Port))
 	if err := r.Run(fmt.Sprintf("0.0.0.0:%v", Port)); err != nil {
 		logger.Error("服务器启动失败", "error", err)
 	}
