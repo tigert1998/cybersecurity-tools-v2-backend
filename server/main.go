@@ -39,8 +39,10 @@ func init() {
 	if err != nil {
 		panic("无法打开数据库：" + err.Error())
 	}
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		panic("无法开启 WAL 模式：" + err.Error())
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode=WAL;PRAGMA synchronous=OFF;"); err != nil {
+		panic("无法设置Sqlite：" + err.Error())
 	}
 	createTableSQL := `
 CREATE TABLE IF NOT EXISTS users (
@@ -59,7 +61,6 @@ CREATE TABLE IF NOT EXISTS users (
 	}
 
 	logger = slog.New(slog.NewJSONHandler(file, nil))
-
 }
 
 func loadLatestPackage() (VersionInfo, error) {
