@@ -41,7 +41,7 @@ func init() {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;PRAGMA synchronous=OFF;"); err != nil {
+	if _, err := db.Exec("PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;"); err != nil {
 		panic("无法设置Sqlite：" + err.Error())
 	}
 	createTableSQL := `
