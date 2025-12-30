@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	ReportStoreDir    = "./reports"
 	PackageStoreDir   = "./packages"
 	VersionConfigPath = "./packages/version.json"
 	LogFilePath       = "./log.txt"
@@ -149,6 +150,32 @@ func main() {
 		}
 		latestPackage := value.(VersionInfo)
 		c.FileAttachment(filepath.Join(PackageStoreDir, latestPackage.Path), filepath.Base(latestPackage.Path))
+	})
+
+	r.POST("/report", func(c *gin.Context) {
+		file, err := c.FormFile("file")
+		if err != nil {
+			c.String(http.StatusBadRequest, "Fail to receive file")
+			return
+		}
+
+		clientIP := c.ClientIP()
+		folderName := strings.ReplaceAll(clientIP, ":", "-")
+		targetDir := filepath.Join(ReportStoreDir, folderName)
+
+		if err := os.MkdirAll(targetDir, 0777); err != nil {
+			c.String(http.StatusInternalServerError, "Server internal error")
+			return
+		}
+
+		dst := filepath.Join(targetDir, file.Filename)
+
+		if err := c.SaveUploadedFile(file, dst); err != nil {
+			c.String(http.StatusInternalServerError, "Server internal error")
+			return
+		}
+
+		c.String(http.StatusOK, "")
 	})
 
 	logger.Info(fmt.Sprintf("服务器运行于：0.0.0.0:%v", Port))
